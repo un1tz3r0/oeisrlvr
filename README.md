@@ -1,6 +1,6 @@
 # OEIS RLVR: Reinforcement Learning for Integer Sequence Reasoning
 
-**OEIS RLVR** trains large language models to synthesize closed-form functions from integer sequences, using reinforcement learning with human feedback (RLVR) over the [On-Line Encyclopedia of Integer Sequences](https://oeis.org/).
+**OEIS RLVR** trains large language models to synthesize closed-form functions from integer sequences, using **reinforcement learning with verifiable rewards** (RLVR) over a synthetic dataset based on information from the [On-Line Encyclopedia of Integer Sequences](https://oeis.org/).
 
 ## Vision
 
@@ -10,7 +10,9 @@ Integer sequences encode diverse mathematical relationships — combinatorial st
 - **Pattern recognition** — the model learns to abstract from limited examples.
 - **Mathematical intuition** — it encounters deep mathematical structures at scale.
 
-These abilities transfer to other reasoning tasks requiring rational thought and problem-solving.
+These abilities transfer to other reasoning tasks requiring rational thought and problem-solving via neural superposition... the patterns in the OEIS reinforce similar patterns elsewhere in the model's understanding of the language and through it, reality.
+
+At least, that's the idea.
 
 ## Overview
 
