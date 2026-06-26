@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific
+.venv/
+unsloth_compiled_cache/
+gemma_4_oeis_lora/
+gemma_4_oeis_lora_*/
+outputs/
+*.log
+eval_*.log
+run*.log
+outcomes.json
+.claude/
+__pycache__/
+
+# Large files (cached HuggingFace models, etc.)
+*.safetensors
+*.bin
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data (oeisdata is large, user should clone separately)
+oeisdata/
