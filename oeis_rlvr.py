@@ -18,10 +18,12 @@ Pieces:
 from __future__ import annotations
 
 import ast
+import datetime as _dt
 import glob as _glob
 import json
 import random
 import signal
+import threading as _threading
 from dataclasses import dataclass
 
 from oeis_parser import parse_file
@@ -57,9 +59,13 @@ The sequence is indexed starting at n={offset}. Known terms:
 
 Requirements:
 - Define exactly: def a(n): ...
-- Use only native Python built-ins. No import statements.
+- All code, including any imports, must be inside a(n).
+- You may import these modules: math, cmath, fractions, decimal, numbers,
+  itertools, functools, operator, statistics, sympy, mpmath. numpy is allowed
+  too, but its integers are fixed-width -- avoid it for large terms and prefer
+  exact tools (math.comb, math.factorial, math.isqrt, math.gcd,
+  fractions.Fraction, sympy). No other imports (no os, sys, etc.).
 - Find the general rule; do NOT hardcode a lookup table of the terms above.
-- All helper code must be inside a(n).
 
 Output only the function in a single Python code block:
 ```python
@@ -117,6 +123,34 @@ def build_dataset(
 
 # --- sandboxed evaluation ---------------------------------------------------
 
+# Modules a candidate may import. Curated math/scientific set only: enough to
+# express real formulas without handing model-generated code os/subprocess/etc.
+# Restricted builtins are not a hard security boundary, but this keeps the
+# common accidental footgun -- the model reaches for `import` during RL
+# exploration -- off the training host.
+_ALLOWED_MODULES = frozenset({
+    "math", "cmath", "fractions", "decimal", "numbers",
+    "itertools", "functools", "operator", "statistics",
+    "numpy", "sympy", "mpmath",
+})
+
+# Pre-load the heavy allowed modules once so a candidate's first `import sympy`
+# is a cached sys.modules hit, not a multi-hundred-ms cost under the eval alarm.
+for _m in ("numpy", "sympy", "mpmath"):
+    try:
+        __import__(_m)
+    except ImportError:
+        pass
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """__import__ replacement for the sandbox: only whitelisted top-level modules."""
+    top = name.split(".")[0]
+    if level != 0 or top not in _ALLOWED_MODULES:
+        raise ImportError(f"import of {name!r} not allowed")
+    return __import__(name, globals, locals, fromlist, level)
+
+
 # A deliberately small allow-list of builtins the candidate may use.
 _SAFE_BUILTINS = {
     name: __builtins__[name] if isinstance(__builtins__, dict) else getattr(__builtins__, name)
@@ -127,6 +161,7 @@ _SAFE_BUILTINS = {
         "True", "False", "None",
     )
 }
+_SAFE_BUILTINS["__import__"] = _safe_import
 
 
 class _Timeout(Exception):
@@ -137,12 +172,46 @@ def _alarm(_signum, _frame):
     raise _Timeout()
 
 
-def _has_import(code: str) -> bool:
+def _disallowed_imports(code: str) -> set[str]:
+    """Top-level module names imported by `code` that are NOT on the allow-list."""
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return False
-    return any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in ast.walk(tree))
+        return set()
+    bad: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for alias in n.names:
+                top = alias.name.split(".")[0]
+                if top not in _ALLOWED_MODULES:
+                    bad.add(top)
+        elif isinstance(n, ast.ImportFrom):
+            if n.level:                       # relative import (from . import x)
+                bad.add(".")
+            else:
+                top = (n.module or "").split(".")[0]
+                if top not in _ALLOWED_MODULES:
+                    bad.add(top)
+    return bad
+
+
+def _as_int(got):
+    """Coerce an exact-integer result to a Python int, or return None.
+
+    Accepts Python int and exact integers from allowed libs (sympy.Integer,
+    numpy.int64, ...). Rejects bool and float (incl. numpy.float64, a float
+    subclass) so the original "must return an int" contract is unchanged, plus
+    non-integral values. Avoids float() so arbitrary-precision bignums survive.
+    """
+    if isinstance(got, (bool, float)):
+        return None
+    if isinstance(got, int):
+        return got
+    try:
+        gi = int(got)
+        return gi if gi == got else None     # gi == got is False for Fraction(1,2), Decimal('2.5')
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def extract_function(text: str) -> str | None:
@@ -163,10 +232,12 @@ def extract_function(text: str) -> str | None:
 def compile_candidate(code: str):
     """Compile ``code`` and return its ``a`` callable, or raise.
 
-    Rejects imports and runs in a namespace with only the safe builtins.
+    Rejects non-whitelisted imports and runs in a namespace with only the safe
+    builtins (whose ``__import__`` permits the allow-listed modules).
     """
-    if _has_import(code):
-        raise ValueError("import statement not allowed")
+    bad = _disallowed_imports(code)
+    if bad:
+        raise ValueError(f"import not allowed: {', '.join(sorted(bad))}")
     namespace: dict = {"__builtins__": _SAFE_BUILTINS}
     compiled = compile(code, "<candidate>", "exec")
     exec(compiled, namespace)  # noqa: S102 -- sandboxed builtins, no imports
@@ -176,11 +247,12 @@ def compile_candidate(code: str):
     return fn
 
 
-def evaluate(code: str, task: Task, timeout: int = 5) -> tuple[int, int]:
+def evaluate(code: str, task: Task, timeout: int = 5, *, _detail: list | None = None) -> tuple[int, int]:
     """Run ``a(n)`` across the task's terms.
 
     Returns ``(shown_correct, holdout_correct)``. The whole evaluation shares one
     wall-clock ``timeout`` to defend against infinite loops.
+    If ``_detail`` is a list, per-term results are appended to it for trace logging.
     """
     fn = compile_candidate(code)
     terms = task.shown + task.holdout
@@ -189,15 +261,34 @@ def evaluate(code: str, task: Task, timeout: int = 5) -> tuple[int, int]:
     signal.alarm(timeout)
     try:
         for i, expected in enumerate(terms):
+            phase = "shown" if i < len(task.shown) else "holdout"
             try:
                 got = fn(task.offset + i)
             except _Timeout:
+                if _detail is not None:
+                    _detail.append({"n": task.offset + i, "phase": phase,
+                                    "expected": expected, "got": None,
+                                    "match": False, "error": "timeout"})
                 raise
-            except Exception:  # noqa: BLE001 -- a bad term is just a mismatch
+            except Exception as e:  # noqa: BLE001 -- a bad term is just a mismatch
+                if _detail is not None:
+                    _detail.append({"n": task.offset + i, "phase": phase,
+                                    "expected": expected, "got": None,
+                                    "match": False, "error": repr(e)})
                 continue
-            if isinstance(got, bool) or not isinstance(got, int):
+            got_int = _as_int(got)
+            if got_int is None:
+                if _detail is not None:
+                    _detail.append({"n": task.offset + i, "phase": phase,
+                                    "expected": expected, "got": repr(got),
+                                    "match": False, "error": "wrong_type"})
                 continue
-            if got == expected:
+            match = (got_int == expected)
+            if _detail is not None:
+                _detail.append({"n": task.offset + i, "phase": phase,
+                                "expected": expected, "got": got_int,
+                                "match": match, "error": None})
+            if match:
                 if i < len(task.shown):
                     shown_correct += 1
                 else:
@@ -258,33 +349,95 @@ def export_outcomes(path: str) -> dict:
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Trace logging — enabled by open_trace(); no-op otherwise.
+# Each GRPO step emits one JSONL record per completion with: prompt, completion,
+# extracted function, per-reward scores + reasons, full eval term detail.
+# ---------------------------------------------------------------------------
+_trace_lock = _threading.Lock()
+_trace_file = None
+_trace_step = 0          # incremented once per batch in function_works
+_trace_accum: dict = {}  # (step, idx) -> partial record; flushed by sequence_matches
+
+
+def open_trace(path: str) -> None:
+    global _trace_file
+    _trace_file = open(path, "a", buffering=1)  # line-buffered
+
+
+def close_trace() -> None:
+    global _trace_file
+    if _trace_file is not None:
+        _trace_file.close()
+        _trace_file = None
+
+
+def _trace_add(step: int, idx: int, **fields) -> None:
+    if _trace_file is None:
+        return
+    with _trace_lock:
+        _trace_accum.setdefault((step, idx), {}).update(fields)
+
+
+def _trace_emit(step: int, idx: int, **fields) -> None:
+    """Merge accumulated partial fields, add final fields, write one JSONL line."""
+    if _trace_file is None:
+        return
+    with _trace_lock:
+        rec = _trace_accum.pop((step, idx), {})
+    rec.update(fields)
+    rec["step"] = step
+    rec["ts"] = _dt.datetime.now().isoformat()
+    rec["reward_total"] = rec.get("fw_score", 0) + rec.get("nc_score", 0) + rec.get("sm_score", 0)
+    with _trace_lock:
+        _trace_file.write(json.dumps(rec) + "\n")
+
+
 def function_works(completions, **kwargs):
     """+1 if a valid, compilable a(n) was produced; negative otherwise."""
+    global _trace_step
+    if _trace_file is not None:
+        with _trace_lock:
+            _trace_step += 1
+    step = _trace_step
     scores = []
-    for completion in completions:
-        fx = extract_function(completion[0]["content"])
+    for i, completion in enumerate(completions):
+        text = completion[0]["content"]
+        fx = extract_function(text)
         if fx is None:
             scores.append(-2.0)
+            _trace_add(step, i, completion=text, function=None,
+                       fw_score=-2.0, fw_reason="no_function_found")
             continue
         try:
             compile_candidate(fx)
             scores.append(1.0)
-        except Exception:  # noqa: BLE001
+            _trace_add(step, i, completion=text, function=fx,
+                       fw_score=1.0, fw_reason="ok")
+        except Exception as e:  # noqa: BLE001
             scores.append(-1.0)
+            _trace_add(step, i, completion=text, function=fx,
+                       fw_score=-1.0, fw_reason=repr(e))
     return scores
 
 
 def no_cheating(completions, **kwargs):
-    """Penalize import statements (the only sandbox escape we forbid)."""
+    """Penalize imports of non-whitelisted modules (allowed math/sci ones are fine)."""
+    step = _trace_step
     scores = []
-    for completion in completions:
+    for i, completion in enumerate(completions):
         fx = extract_function(completion[0]["content"])
         if fx is None:
             scores.append(-1.0)
-        elif _has_import(fx):
+            _trace_add(step, i, nc_score=-1.0, nc_reason="no_function_found")
+            continue
+        bad = _disallowed_imports(fx)
+        if bad:
             scores.append(-20.0)
+            _trace_add(step, i, nc_score=-20.0, nc_reason=f"bad_import:{','.join(sorted(bad))}")
         else:
             scores.append(1.0)
+            _trace_add(step, i, nc_score=1.0, nc_reason="ok")
     return scores
 
 
@@ -295,28 +448,48 @@ def sequence_matches(completions, **kwargs):
     rule earns the shown credit, the (heavily weighted) holdout credit, and a
     large bonus for matching every term.
     """
+    step = _trace_step
     scores = []
     for i, completion in enumerate(completions):
         fx = extract_function(completion[0]["content"])
+        task = _tasks_from_kwargs(kwargs, i)
         if fx is None:
             scores.append(0.0)
             _record_outcome(kwargs, i, solved=False, any_holdout=False)
+            _trace_emit(step, i, anum=task.anum, name=task.name,
+                        prompt=task.prompt_text(), sm_score=0.0,
+                        sm_reason="no_function_found",
+                        shown_ok=0, hold_ok=0, eval_detail=None)
             continue
-        task = _tasks_from_kwargs(kwargs, i)
+        detail: list | None = [] if _trace_file else None
         try:
-            shown_ok, hold_ok = evaluate(fx, task)
-        except Exception:  # noqa: BLE001 -- compile/exec failure
+            shown_ok, hold_ok = evaluate(fx, task, _detail=detail)
+        except Exception as e:  # noqa: BLE001 -- compile/exec failure
             scores.append(-2.0)
             _record_outcome(kwargs, i, solved=False, any_holdout=False)
+            _trace_emit(step, i, anum=task.anum, name=task.name,
+                        prompt=task.prompt_text(), sm_score=-2.0,
+                        sm_reason=repr(e), shown_ok=0, hold_ok=0,
+                        eval_detail=detail)
             continue
         shown_frac = shown_ok / max(1, len(task.shown))
         hold_frac = hold_ok / max(1, len(task.holdout))
-        reward = 1.0 * shown_frac + 8.0 * hold_frac
         solved = shown_ok == len(task.shown) and hold_ok == len(task.holdout)
+        lookup = shown_ok == len(task.shown) and hold_ok == 0
         if solved:
-            reward += 20.0  # fully general solution
+            reward = 1.0 * shown_frac + 10.0 * hold_frac + 20.0  # fully general
+        elif lookup:
+            reward = -5.0  # passes every shown term, zero holdout -> hardcoded lookup
+        else:
+            reward = 1.0 * shown_frac + 10.0 * hold_frac
         scores.append(reward)
         _record_outcome(kwargs, i, solved=solved, any_holdout=hold_ok > 0)
+        _trace_emit(step, i, anum=task.anum, name=task.name,
+                    prompt=task.prompt_text(), sm_score=reward,
+                    sm_reason=(f"shown={shown_ok}/{len(task.shown)} "
+                               f"holdout={hold_ok}/{len(task.holdout)}"
+                               + (" SOLVED" if solved else " LOOKUP" if lookup else "")),
+                    shown_ok=shown_ok, hold_ok=hold_ok, eval_detail=detail)
     return scores
 
 

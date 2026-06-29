@@ -42,9 +42,15 @@ ap = argparse.ArgumentParser()
 ap.add_argument("-n", type=int, default=40, help="held-out sequences")
 ap.add_argument("-k", type=int, default=1, help="samples per task (1=greedy)")
 ap.add_argument("-t", type=int, default=3072, help="max new tokens")
+ap.add_argument("--adapter-a", default="base",
+                help="first condition: 'base' or an adapter dir (default: base)")
+ap.add_argument("--adapter-b", default="gemma_4_oeis_lora",
+                help="second condition: 'base' or an adapter dir (default: gemma_4_oeis_lora)")
+ap.add_argument("--adapters", nargs="+", default=None,
+                help="N conditions to compare ('base'/dir each); overrides -a/-b")
+ap.add_argument("--jsonl", default=None, help="write results summary as JSON to this path")
 args = ap.parse_args()
 N_EVAL, K, MAX_NEW_TOKENS = args.n, args.k, args.t
-ADAPTER_DIR = "gemma_4_oeis_lora"
 max_seq_length = 4096
 
 # Held-out set: qualifying sequences just beyond the 5000 the training pool used.
@@ -113,25 +119,71 @@ def score(tasks) -> dict:
                 valid = valid_any, n = n)
 
 
-print("Scoring BASE model (no adapter)...")
-base = score(heldout)
+# Conditions to compare. 'base' = no adapter; otherwise an adapter dir.
+# Attach each distinct adapter once (PEFT multi-adapter) over a single base load;
+# score 'base' by disabling adapters on the wrapped model.
+specs = args.adapters if args.adapters else [args.adapter_a, args.adapter_b]
 
-print(f"Attaching trained adapter from {ADAPTER_DIR}/ ...")
-model = PeftModel.from_pretrained(model, ADAPTER_DIR)
-FastVisionModel.for_inference(model)
-print("Scoring TRAINED model (adapter enabled)...")
-trained = score(heldout)
+
+def _label(spec):
+    return "BASE" if spec == "base" else os.path.basename(spec.rstrip("/"))
+
+
+adapter_name = {}
+for spec in specs:
+    if spec == "base" or spec in adapter_name:
+        continue
+    name = f"ad{len(adapter_name)}"
+    if not isinstance(model, PeftModel):
+        model = PeftModel.from_pretrained(model, spec, adapter_name=name)
+    else:
+        model.load_adapter(spec, adapter_name=name)
+    adapter_name[spec] = name
+if isinstance(model, PeftModel):
+    FastVisionModel.for_inference(model)
+
+
+def score_spec(spec):
+    if spec == "base":
+        if isinstance(model, PeftModel):
+            with model.disable_adapter():
+                return score(heldout)
+        return score(heldout)
+    model.set_adapter(adapter_name[spec])
+    return score(heldout)
+
+
+results = []
+for spec in specs:
+    print(f"Scoring {_label(spec)} ({'no adapter' if spec == 'base' else spec}) ...")
+    results.append((spec, score_spec(spec)))
 
 passk_label = f"pass@{K}" if K > 1 else "fully_solved"
+n_seq = results[0][1]["n"]
 print("\n" + "=" * 64)
-print(f"HELD-OUT COMPARISON ({base['n']} unseen sequences, "
+print(f"HELD-OUT COMPARISON ({n_seq} unseen sequences, "
       f"{'greedy' if K == 1 else f'k={K} temp=1.0'}, max_new_tokens={MAX_NEW_TOKENS})")
 print("=" * 64)
-for label, r in [("BASE   ", base), ("TRAINED", trained)]:
-    print(f"  {label}  mean_holdout_match={r['mean_holdout']:.3f}  "
+for spec, r in results:
+    print(f"  {_label(spec):<24}  mean_holdout_match={r['mean_holdout']:.3f}  "
           f"{passk_label}={r['passk']}/{r['n']}  produced_valid_fn={r['valid']}/{r['n']}")
+# Deltas of the last condition (newest adapter) vs each earlier one.
 print("-" * 64)
-print(f"  Δ mean_holdout_match (trained - base) = "
-      f"{trained['mean_holdout'] - base['mean_holdout']:+.3f}")
-print(f"  Δ {passk_label:<20} = {trained['passk'] - base['passk']:+d}")
-print(f"  Δ produced_valid_fn          = {trained['valid'] - base['valid']:+d}")
+last_spec, last_r = results[-1]
+for spec, r in results[:-1]:
+    print(f"  Δ {_label(last_spec)} - {_label(spec)}:  "
+          f"mean_holdout={last_r['mean_holdout'] - r['mean_holdout']:+.3f}  "
+          f"{passk_label}={last_r['passk'] - r['passk']:+d}  "
+          f"valid_fn={last_r['valid'] - r['valid']:+d}")
+
+if args.jsonl:
+    import json
+    with open(args.jsonl, "w") as f:
+        json.dump({
+            "n": n_seq, "k": K, "max_new_tokens": MAX_NEW_TOKENS,
+            "passk_label": passk_label,
+            "conditions": [
+                {"spec": spec, "label": _label(spec), **r} for spec, r in results
+            ],
+        }, f, indent=2)
+    print(f"Wrote results -> {args.jsonl}")

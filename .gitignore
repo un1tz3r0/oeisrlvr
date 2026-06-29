@@ -34,16 +34,23 @@ env/
 *~
 .DS_Store
 
+# Attic (scratch/archived files)
+attic/
+
 # Project-specific
 .venv/
 unsloth_compiled_cache/
 gemma_4_oeis_lora/
 gemma_4_oeis_lora_*/
 outputs/
+outputs_*/
+training/
 *.log
 eval_*.log
 run*.log
 outcomes.json
+outcomes_*.json
+trace*.jsonl
 .claude/
 __pycache__/
 

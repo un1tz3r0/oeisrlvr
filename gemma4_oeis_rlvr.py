@@ -46,14 +46,81 @@ try:
 except Exception:
     pass
 
+# ---------------------------------------------------------------------------
+# CLI configuration. Parsed before the heavy imports so --help is instant and
+# an orchestrating TUI can validate args without loading the model. All values
+# were previously hardcoded constants; defaults reproduce the original run.
+# ---------------------------------------------------------------------------
+import argparse, glob as _glob, re as _re, os as _os
+
+
+def _next_stem(warmstart: str) -> str:
+    """Next free incrementally-numbered adapter dir off `warmstart`'s base stem.
+
+    'gemma_4_oeis_lora' or 'gemma_4_oeis_lora_03' both have base
+    'gemma_4_oeis_lora'; returns 'gemma_4_oeis_lora_NN', NN one past the highest
+    existing numbered sibling (01 if none yet).
+    """
+    base = _re.sub(r"_\d+$", "", warmstart.rstrip("/"))
+    nums = [int(m.group(1)) for d in _glob.glob(f"{base}_*")
+            if (m := _re.fullmatch(rf"{_re.escape(base)}_(\d+)", d))]
+    return f"{base}_{(max(nums) + 1) if nums else 1:02d}"
+
+
+_ap = argparse.ArgumentParser(description="GRPO-train a LoRA adapter on OEIS sequences.")
+_ap.add_argument("--warmstart", default="gemma_4_oeis_lora",
+                 help="adapter dir to warm-start from (skipped if missing)")
+_ap.add_argument("--out", default=None,
+                 help="adapter dir to save to (default: next numbered stem off --warmstart)")
+_ap.add_argument("--max-steps", type=int, default=250)
+_ap.add_argument("--save-steps", type=int, default=50)
+_ap.add_argument("--n-show", type=int, default=10, help="terms shown to the model")
+_ap.add_argument("--min-terms", type=int, default=20, help="min terms to qualify (for holdout)")
+_ap.add_argument("--max-eval-terms", type=int, default=40, help="cap terms used per sequence")
+_ap.add_argument("--limit", type=int, default=5000, help="training pool size")
+_ap.add_argument("--curriculum", default=None,
+                 help="outcomes JSON to read always-solved exclusions from "
+                      "(default: --warmstart's outcomes file, else legacy outcomes.json)")
+_ap.add_argument("--trace", default=None, help="JSONL trace path (default: trace_<out>.jsonl)")
+_ap.add_argument("--outcomes", default=None,
+                 help="outcomes JSON to write (default: outcomes_<out>.json)")
+_ap.add_argument("--output-dir", default=None, help="checkpoint dir (default: outputs_<out>)")
+# Model / LoRA / optimizer params (previously hardcoded; driven by model.toml).
+_ap.add_argument("--base-model", default="unsloth/gemma-4-E2B-it")
+_ap.add_argument("--max-seq-length", type=int, default=4096)
+_ap.add_argument("--lora-rank", type=int, default=32)
+_ap.add_argument("--lora-alpha", type=int, default=None, help="default: 2*lora_rank")
+_ap.add_argument("--learning-rate", type=float, default=5e-5)
+_ap.add_argument("--num-generations", type=int, default=4)
+_ap.add_argument("--max-grad-norm", type=float, default=0.1)
+args = _ap.parse_args()
+
+if args.lora_alpha is None:
+    args.lora_alpha = 2 * args.lora_rank
+
+if args.out is None:
+    args.out = _next_stem(args.warmstart)
+_stem = _os.path.basename(args.out.rstrip("/"))
+if args.trace is None:
+    args.trace = f"trace_{_stem}.jsonl"
+if args.outcomes is None:
+    args.outcomes = f"outcomes_{_stem}.json"
+if args.output_dir is None:
+    args.output_dir = f"outputs_{_stem}"
+if args.curriculum is None:
+    _ws_outcomes = f"outcomes_{_os.path.basename(args.warmstart.rstrip('/'))}.json"
+    args.curriculum = _ws_outcomes if _os.path.exists(_ws_outcomes) else "outcomes.json"
+print(f"Config: warmstart={args.warmstart} out={args.out} max_steps={args.max_steps} "
+      f"curriculum={args.curriculum} trace={args.trace} outcomes={args.outcomes}")
+
 from unsloth import FastVisionModel
 import torch
 
-max_seq_length = 4096   # room for reasoning + the function
-lora_rank = 32
+max_seq_length = args.max_seq_length   # room for reasoning + the function
+lora_rank = args.lora_rank
 
 model, tokenizer = FastVisionModel.from_pretrained(
-    model_name = "unsloth/gemma-4-E2B-it",
+    model_name = args.base_model,
     max_seq_length = max_seq_length,
     load_in_4bit = False,    # False for LoRA 16bit
     fast_inference = False,  # vLLM unsupported for Gemma4 vision (siglip+gemma4)
@@ -66,10 +133,21 @@ model = FastVisionModel.get_peft_model(
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
     ],
-    lora_alpha = lora_rank * 2,
+    lora_alpha = args.lora_alpha,
     use_gradient_checkpointing = "unsloth",
     random_state = 3407,
 )
+
+# Warm-start: if the chosen adapter exists, load its weights over the
+# freshly-initialised LoRA so training continues from where it left off.
+if _os.path.exists(f"{args.warmstart}/adapter_model.safetensors"):
+    try:
+        from peft import set_peft_model_state_dict as _set_peft_sd
+        from safetensors.torch import load_file as _load_sf
+        _set_peft_sd(model, _load_sf(f"{args.warmstart}/adapter_model.safetensors"))
+        print(f"Warm-started LoRA from {args.warmstart}/")
+    except Exception as _e:
+        print(f"Warm-start failed ({_e}), starting with fresh LoRA.")
 
 # ---------------------------------------------------------------------------
 # OEIS environment, dataset and rewards (see oeis_rlvr.py).
@@ -81,16 +159,16 @@ from oeis_rlvr import build_dataset, REWARD_FUNCS
 # solved (zero-variance groups give no GRPO signal). No-op on the first run.
 import json, os
 exclude_anums = frozenset()
-if os.path.exists("outcomes.json"):
-    with open("outcomes.json") as f:
+if os.path.exists(args.curriculum):
+    with open(args.curriculum) as f:
         exclude_anums = frozenset(json.load(f)["always_solved"])
-    print(f"Curriculum: excluding {len(exclude_anums)} always-solved sequences (outcomes.json).")
+    print(f"Curriculum: excluding {len(exclude_anums)} always-solved sequences ({args.curriculum}).")
 
 tasks = build_dataset(
-    n_show = 10,            # terms shown to the model
-    min_terms = 20,        # so there are >= 10 holdout terms
-    max_eval_terms = 40,   # cap eval cost on fast-growing sequences
-    limit = 5000,          # size of the training pool
+    n_show = args.n_show,                 # terms shown to the model
+    min_terms = args.min_terms,           # so there are >= (min_terms - n_show) holdout terms
+    max_eval_terms = args.max_eval_terms, # cap eval cost on fast-growing sequences
+    limit = args.limit,                   # size of the training pool
     exclude_anums = exclude_anums,
 )
 print(f"Built {len(tasks)} OEIS tasks.")
@@ -139,20 +217,24 @@ from trl import GRPOConfig, GRPOTrainer
 
 training_args = GRPOConfig(
     temperature = 1.0,
-    learning_rate = 5e-5,
+    learning_rate = args.learning_rate,
     weight_decay = 0.001,
     warmup_ratio = 0.1,
     lr_scheduler_type = "linear",
     optim = "adamw_8bit",
     logging_steps = 1,
     per_device_train_batch_size = 1,
-    gradient_accumulation_steps = 2,
-    num_generations = 2,
+    # One prompt-group per optimizer step: accumulate over exactly the prompt's
+    # num_generations completions. Also keeps batch (1*grad_accum) divisible by
+    # num_generations, which GRPO requires.
+    gradient_accumulation_steps = args.num_generations,
+    num_generations = args.num_generations,
     max_completion_length = max_completion_length,
-    max_steps = 60,
-    save_steps = 100,
+    max_grad_norm = args.max_grad_norm,
+    max_steps = args.max_steps,
+    save_steps = args.save_steps,
     report_to = "none",
-    output_dir = "outputs",
+    output_dir = args.output_dir,
     epsilon = 0.2,
     epsilon_high = 0.28,
     delta = 1.5,
@@ -167,22 +249,26 @@ trainer = GRPOTrainer(
     args = training_args,
     train_dataset = dataset,
 )
+import oeis_rlvr as _oeis_rlvr_mod
+_oeis_rlvr_mod.open_trace(args.trace)
 trainer.train()
+_oeis_rlvr_mod.close_trace()
 
 # Record which sampled sequences were always-solved (drop them next run via
 # build_dataset(exclude_anums=...) -- zero-variance groups give no GRPO signal)
 # or never matched a single holdout term (too hard).
 from oeis_rlvr import export_outcomes
-_summary = export_outcomes("outcomes.json")
-print(f"Outcomes for {_summary['seen']} sampled sequences -> outcomes.json: "
+_summary = export_outcomes(args.outcomes)
+print(f"Outcomes for {_summary['seen']} sampled sequences -> {args.outcomes}: "
       f"{len(_summary['always_solved'])} always-solved (omit next run), "
       f"{len(_summary['never_matched'])} never-matched.")
 
 # ---------------------------------------------------------------------------
 # Save the trained LoRA.
 # ---------------------------------------------------------------------------
-model.save_pretrained("gemma_4_oeis_lora")
-tokenizer.save_pretrained("gemma_4_oeis_lora")
+model.save_pretrained(args.out)
+tokenizer.save_pretrained(args.out)
+print(f"Saved adapter -> {args.out}/")
 
 # Inference with the trained adapter:
 text = tokenizer.apply_chat_template(
