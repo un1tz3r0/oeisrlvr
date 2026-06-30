@@ -1,4 +1,4 @@
-![oeisrlvr](oeisrlvr_splash.png)
+![oeisrlvr](docs/splash.png)
 
 # OEIS RLVR: Reinforcement Learning for Integer Sequence Reasoning
 
