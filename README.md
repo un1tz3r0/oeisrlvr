@@ -21,10 +21,40 @@ The pipeline:
 1. **Dataset synthesis** (`oeis_rlvr.py:build_dataset`): Filter OEIS sequences by keywords, split each into shown terms (prompt input) and held-out terms (reward signal).
 2. **Training** (`gemma4_oeis_rlvr.py`): Fine-tune Gemma-4-E2B-it with LoRA via GRPO, optimizing three rewards:
    - `function_works`: does the emitted `def a(n)` parse and compile?
-   - `no_cheating`: does it avoid imports (stays in sandboxed builtins)?
+   - `no_cheating`: does it import only from a curated math/scientific allow-list (`math`, `fractions`, `sympy`, `numpy`, ...), not `os`/`subprocess`/etc.?
    - `sequence_matches`: do the function's outputs match held-out terms?
 3. **Evaluation** (`eval_oeis.py`): Score base and trained models on held-out sequences (greedy and/or sampled at temperature 1.0).
 4. **Curriculum** (`outcomes.json`): After training, identify always-solved sequences (zero GRPO signal) and omit them from the next run.
+
+## Orchestration: cycles, train & eval (`rlvrctl` / `rlvrtui`)
+
+Day-to-day work goes through **`rlvrctl.py`** (CLI) or **`rlvrtui.py`** (a Textual TUI
+over it). They own a per-model directory under `training/<model>/` and drive the
+lower-level `gemma4_oeis_rlvr.py` / `eval_oeis.py` scripts, running each stage as a
+detached supervisor so you can quit and reattach.
+
+```bash
+rlvrctl.py init   --model gemma4-oeis-e2b              # create training/<model>/ + config
+rlvrctl.py train  --model gemma4-oeis-e2b              # one training cycle (warm-started from the latest)
+rlvrctl.py eval   --model gemma4-oeis-e2b --adapter-a base --adapter-b 003
+rlvrctl.py status --model gemma4-oeis-e2b              # cycle + eval history
+rlvrtui.py                                             # interactive dashboard
+```
+
+**Layout.** Each *training* run is a gap-free numbered checkpoint `training/<model>/NNN/`
+(holding its `adapter/`, `checkpoints/`, `trace.jsonl`). Each *eval* lives under the
+**highest** checkpoint it compares, in an `evals/` subdir named for the *other*
+participants; every earlier participant — including the base model, under `base/` — gets a
+relative symlink to it. A `.N` suffix disambiguates repeated evals of the same set. For an
+eval of checkpoint `003` vs `base`:
+
+```
+training/<model>/003/evals/base/        # real results (eval.json, run.log, config.toml)
+training/<model>/base/evals/003  ->  ../../003/evals/base
+```
+
+Config is layered per model: `model.toml` defaults ← `training.toml` / `eval.toml`
+persistent overrides ← their `[ephemeral]` one-shot overrides.
 
 ## Setup
 
@@ -185,15 +215,16 @@ uv run python gemma4_oeis_rlvr.py
 
 ```
 oeisrlvr/
-  ├── gemma4_oeis_rlvr.py       # Training script (GRPO, LoRA, 60 steps)
-  ├── eval_oeis.py              # Evaluation: base vs trained, greedy & sampled
-  ├── oeis_rlvr.py              # Core env: task build, sandbox, rewards
+  ├── rlvrctl.py                # Orchestrator (CLI): cycles, train/eval, status
+  ├── rlvrtui.py                # Textual TUI over rlvrctl
+  ├── gemma4_oeis_rlvr.py       # Training script (GRPO, LoRA)
+  ├── eval_oeis.py              # Held-out eval: base vs adapters, greedy & pass@k
+  ├── oeis_rlvr.py              # Core env: dataset, sandbox, reward functions
   ├── oeis_parser.py            # Parse OEIS .seq internal format
-  ├── test_oeis_rlvr.py         # Reward separation tests
-  ├── test_parser.py            # Parser tests
   ├── oeisdata/                 # OEIS sequences (clone separately)
-  ├── gemma_4_oeis_lora/        # Saved LoRA adapter (after training)
-  ├── outcomes.json             # Curriculum signals (after training)
+  ├── docs/                     # Help notes & design docs
+  ├── training/                 # Per-model cycles & evals (gitignored; see Orchestration)
+  ├── CHANGELOG.md              # Notable changes
   └── README.md                 # This file
 ```
 
@@ -209,7 +240,8 @@ oeisrlvr/
 
 ### TUI for Training Workflows
 
-See `TODO_TUI_APP.md` for a planned interactive terminal UI to manage train → eval → curriculum cycles.
+`rlvrtui.py` is an interactive Textual dashboard over `rlvrctl` for the
+train → eval → curriculum loop (model select, configure, auto loop, live run monitor).
 
 ### Reward Customization
 

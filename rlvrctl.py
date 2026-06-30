@@ -190,6 +190,68 @@ def resolve_adapter(model_d: str, spec: str) -> str:
     return spec
 
 
+# --- eval directory layout --------------------------------------------------
+# Evals live under the checkpoints they compare, not in the top-level NNN
+# namespace. Each participant gets an evals/ entry named for the *other*
+# participants; the entry under the highest checkpoint is the real dir, the rest
+# are relative symlinks to it. A '.N' suffix disambiguates a repeated set.
+
+def _label_order(label: str) -> int:
+    """Order of checkpoint labels: base earliest, then train number; raw paths last."""
+    if label == "base":
+        return -1
+    return int(label) if label.isdigit() else 1_000_000
+
+
+def _checkpoint_label(spec: str) -> str:
+    """Eval spec -> checkpoint label for evals/ dir names.
+
+    'base' -> 'base'; a digit or a '<dir>/NNN/adapter' path -> 'NNN'; otherwise the
+    spec's basename (best-effort for an arbitrary adapter path).
+    """
+    if spec == "base":
+        return "base"
+    if spec.isdigit():
+        return f"{int(spec):03d}"
+    parts = os.path.normpath(spec).split(os.sep)
+    if len(parts) >= 2 and parts[-1] == "adapter" and parts[-2].isdigit():
+        return f"{int(parts[-2]):03d}"
+    return os.path.basename(spec.rstrip("/")) or spec
+
+
+def _next_suffix(evals_dir: str, base_name: str) -> int:
+    """1 if `base_name` is free in `evals_dir` (bare), else the first free N>=2."""
+    existing = set(os.listdir(evals_dir)) if os.path.isdir(evals_dir) else set()
+    if base_name not in existing:
+        return 1
+    n = 2
+    while f"{base_name}.{n}" in existing:
+        n += 1
+    return n
+
+
+def _eval_paths(model_d: str, labels: list[str]) -> tuple[str, list[tuple[str, str]]]:
+    """Real eval dir + [(symlink, relative_target)] for an eval over `labels`.
+
+    `labels` are checkpoint labels ('base' or 'NNN'). The entry under the highest
+    label is the real directory; every other participant gets a relative symlink.
+    """
+    labels = sorted(set(labels), key=_label_order)
+    if len(labels) < 2:
+        sys.exit(f"eval needs >= 2 distinct checkpoints, got {labels}")
+    latest = labels[-1]
+    entry = lambda of: "+".join(L for L in labels if L != of)  # labels pre-sorted
+    evals_dir = os.path.join(model_d, latest, "evals")
+    n = _next_suffix(evals_dir, entry(latest))
+    sfx = "" if n == 1 else f".{n}"
+    real_dir = os.path.join(evals_dir, entry(latest) + sfx)
+    links = []
+    for L in labels[:-1]:
+        link = os.path.join(model_d, L, "evals", entry(L) + sfx)
+        links.append((link, os.path.relpath(real_dir, os.path.dirname(link))))
+    return real_dir, links
+
+
 def train_argv(cycle_dir: str, model_p: dict, train_c: dict, warmstart: str | None,
                curriculum: str | None) -> list[str]:
     argv = [sys.executable, os.path.join(REPO, "gemma4_oeis_rlvr.py"),
@@ -252,9 +314,11 @@ def start_train(model: str) -> tuple[str, int]:
 
 
 def start_eval(model: str, specs: list[str] | None = None) -> tuple[str, int]:
-    """Create the next eval cycle comparing `specs` and launch it.
+    """Create an eval comparing `specs` and launch it; default base vs latest-train.
 
-    specs are 'base' | cycle-number | path; default base vs latest-train.
+    specs are 'base' | cycle-number | adapter path. Results live under the highest
+    checkpoint's evals/ dir; the other participants get relative symlinks to it
+    (see _eval_paths). Returns the real eval dir and the supervisor pid.
     """
     d = require_model(model)
     model_doc = load_toml(os.path.join(d, "model.toml"))
@@ -262,14 +326,20 @@ def start_eval(model: str, specs: list[str] | None = None) -> tuple[str, int]:
     eval_c = effective(model_doc, evald, "eval_defaults", EVAL_PARAMS)
     if not specs:
         latest = latest_train_adapter(d)
-        specs = ["base", os.path.relpath(latest, d) if latest else "base"]
+        specs = ["base", os.path.basename(os.path.dirname(latest)) if latest else "base"]
+    labels = [_checkpoint_label(s) for s in specs]
     resolved = [resolve_adapter(d, s) for s in specs]
 
-    cycle = next_cycle(d)
-    os.makedirs(cycle)
-    write_config(cycle, "eval", model, eval_c, adapters=resolved)
-    pid = spawn(cycle, "eval", os.path.join(d, "eval.toml"))
-    return cycle, pid
+    real_dir, links = _eval_paths(d, labels)
+    os.makedirs(real_dir)
+    write_config(real_dir, "eval", model, eval_c, adapters=resolved, labels=labels)
+    for link, target in links:
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if os.path.islink(link) or os.path.exists(link):
+            os.remove(link)
+        os.symlink(target, link)
+    pid = spawn(real_dir, "eval", os.path.join(d, "eval.toml"))
+    return real_dir, pid
 
 
 def cmd_train(a) -> None:
@@ -389,8 +459,34 @@ def create_model(name: str, overrides: dict | None = None) -> str:
     return d
 
 
+def eval_runs(d: str) -> list[dict]:
+    """One row per real eval dir (non-symlink) under any train cycle's evals/.
+
+    The real dir lives under the highest checkpoint of each eval, so scanning the
+    train cycles covers every eval exactly once (the symlinks under earlier
+    checkpoints -- and under base/ -- are skipped).
+    """
+    rows = []
+    for n, path in cycles(d):
+        evals_dir = os.path.join(path, "evals")
+        if not os.path.isdir(evals_dir):
+            continue
+        for e in sorted(os.listdir(evals_dir)):
+            full = os.path.join(evals_dir, e)
+            if os.path.islink(full) or not os.path.isdir(full):
+                continue
+            cfg = load_toml(os.path.join(full, "config.toml"))
+            st = cfg.get("status", {})
+            rows.append({
+                "num": f"{n:03d}/evals/{e}", "kind": "eval",
+                "state": st.get("state", ""), "live": is_live(full),
+                "created": cfg.get("created", ""), "path": full,
+            })
+    return rows
+
+
 def cycle_summary(model: str) -> list[dict]:
-    """One row per cycle for status/dashboard views."""
+    """One row per train cycle, then one per eval run, for status/dashboard views."""
     d = model_dir(model)
     rows = []
     for n, path in cycles(d):
@@ -402,6 +498,7 @@ def cycle_summary(model: str) -> list[dict]:
             "live": is_live(path),
             "created": cfg.get("created", ""), "path": path,
         })
+    rows.extend(eval_runs(d))
     return rows
 
 
@@ -600,7 +697,11 @@ def cmd_status(a) -> None:
 
 
 def cmd_migrate(a) -> None:
-    """One-shot import of the legacy flat artifacts into training/<model>/."""
+    """One-shot import of the legacy flat artifacts into training/<model>/.
+
+    Legacy/obsolete: predates the train-only NNN + nested evals/ layout and writes
+    eval cycles as top-level NNN dirs. Kept for reference; not for new models.
+    """
     d = model_dir(a.model)
     if os.path.exists(d):
         sys.exit(f"{d} already exists; refusing to migrate over it")
